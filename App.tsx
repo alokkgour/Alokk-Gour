@@ -217,7 +217,7 @@ function App() {
     const update = (tasks: AgentTask[]) => 
         tasks.map(t => 
             t.id === taskId && t.status === 'pending' 
-            ? { ...t, priority: t.priority === 'high' ? 'normal' : 'high' as const } 
+            ? { ...t, priority: (t.priority === 'high' ? 'normal' : 'high') as 'normal' | 'high' } 
             : t
         );
 
@@ -267,6 +267,10 @@ function App() {
     if (!searchQuery.trim()) return;
     
     const initialQuery = searchQuery;
+    // Capture history BEFORE adding the new user message
+    // This acts as the "conversation context" for the Planner
+    const historyForPlanner = messages; 
+
     setQuery(''); 
     setCurrentQueryString(initialQuery);
     setActiveTasks([]);
@@ -298,7 +302,9 @@ function App() {
 
     try {
       // 1. PLAN
-      const plannedTasks = await planResearch(initialQuery);
+      // Pass the history so the planner understands context (e.g. "compare it to the previous one")
+      const plannedTasks = await planResearch(initialQuery, historyForPlanner);
+      
       // Initialize tasks with normal priority
       const initialTasks = plannedTasks.map(t => ({ ...t, priority: 'normal' as const }));
       
@@ -370,14 +376,10 @@ Findings: ${result?.text || 'No info'}`;
                 }
             } else if (pending.length > 0 && running.length === 0 && executableTasks.length === 0) {
                  // Deadlock detection or waiting? 
-                 // In a real app, check for circular dependencies or broken refs. 
-                 // For now, we assume if pending exists but not executable, we are waiting for running tasks.
-                 // If running is 0, it's a true deadlock.
                  console.warn("Potential Deadlock: Pending tasks exist but none are executable and nothing is running.");
                  break; 
             } else if (running.length >= MAX_CONCURRENCY) {
                 // Max concurrency reached, wait for something to finish
-                // processQueue will be triggered again when a task finishes
                 return;
             } else {
                // Nothing executable right now, wait.
@@ -406,9 +408,12 @@ Findings: ${result?.text || 'No info'}`;
           // 3. SYNTHESIZE
           setAgentState(AgentState.SYNTHESIZING);
           
-          const lastUserMsg = messages[messages.length - 1];
-          
-          const historyForApi = messages.map(m => ({
+          // We want to pass the history to the synthesizer so it knows what was discussed before.
+          // However, 'messages' currently includes the latest User Query as the last item.
+          // 'synthesizeReport' manually adds the User Query + Findings as the final prompt.
+          // To avoid duplicating the User Query in the prompt (User: Query ... User: Findings for Query), 
+          // we slice off the last message from the history we pass to the API.
+          const historyForApi = messages.slice(0, -1).map(m => ({
             role: m.role,
             parts: [{ text: m.content }]
           }));

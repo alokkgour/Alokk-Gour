@@ -1,6 +1,6 @@
 
 import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
-import { Source, SearchResult, AgentTask } from "../types";
+import { Source, SearchResult, AgentTask, Message } from "../types";
 
 const apiKey = process.env.API_KEY || '';
 
@@ -43,16 +43,32 @@ const extractSources = (response: GenerateContentResponse): Source[] => {
 /**
  * Step 1: PLAN
  * Orchestrates a team of specialized agents based on the user query.
+ * Now accepts history to handle follow-up questions contextually.
  */
-export const planResearch = async (query: string): Promise<AgentTask[]> => {
+export const planResearch = async (query: string, history: Message[] = []): Promise<AgentTask[]> => {
   try {
+    // Format history for the planner
+    const historyContext = history.length > 0 
+      ? history.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n')
+      : "No previous conversation.";
+
     const response = await ai.models.generateContent({
       model: PLANNER_MODEL,
-      contents: `User query: "${query}"
+      contents: `
+      Conversation History:
+      ---
+      ${historyContext}
+      ---
+
+      Current User Query: "${query}"
       
       You are a Chief AI Orchestrator. Your goal is to analyze this query and create a team of 1 to 4 specialized AI Agents to research different aspects of it.
       
-      For example, if the user asks "Should I buy stock X or Y?", create:
+      CRITICAL:
+      - Use the Conversation History to resolve ambiguous references (e.g., "what about the second one?", "compare it to X").
+      - If the user asks a follow-up question, create tasks that specifically address the new angle while keeping the previous context in mind.
+      
+      Example: If user asks "Should I buy stock X or Y?", create:
       1. "Financial Analyst" to look at numbers.
       2. "Market Researcher" to look at news/sentiment.
       
@@ -70,7 +86,7 @@ export const planResearch = async (query: string): Promise<AgentTask[]> => {
               agentRole: { type: Type.STRING, description: "The persona of the agent (e.g., 'Senior Python Dev', 'Historian', 'Travel Planner')" },
               description: { type: Type.STRING, description: "The specific expertise or capabilities of this agent (e.g., 'Expert in 19th century European history')." },
               title: { type: Type.STRING, description: "Short title of the task" },
-              goal: { type: Type.STRING, description: "Specific instruction for this agent on what to find." },
+              goal: { type: Type.STRING, description: "Specific instruction for this agent on what to find. Ensure it is self-contained." },
               dependencies: { 
                 type: Type.ARRAY, 
                 items: { type: Type.STRING }, 
@@ -134,7 +150,7 @@ export const executeResearchTask = async (
     
     Use Google Search to find high-quality, factual information. 
     Do not hallucinate. Rely on the search results.
-    Summarize your findings clearly for the Chief Orchestrator.
+    Summarize your findings clearly for the Chief Orchestrator. Use structured formatting (bullet points, headers) to make it easy to read.
     `;
 
     const response = await ai.models.generateContent({
@@ -186,13 +202,20 @@ export const synthesizeReport = async (
     User Query: "${query}"
     
     You have received detailed reports from your team of specialized agents.
-    Your job is to synthesize these into a single, comprehensive, and beautiful answer.
+    Your job is to synthesize these into a single, highly organized, and easy-to-read answer.
     
-    Rules:
-    1. Answer the user's original query directly using the provided research.
-    2. Structure with clear headings, lists, and tables where appropriate.
-    3. You can mention "Our financial analyst found..." or "The historical data suggests..." to add authority, but keep it flowing naturally.
-    4. Output formatted Markdown.
+    # FORMATTING GUIDELINES (CRITICAL):
+    1. **Executive Summary**: Start with a direct, high-level answer to the query (2-3 sentences).
+    2. **Structured Sections**: Use clear ## Headings to separate different sub-topics.
+    3. **Readability**: 
+       - Use **bullet points** for lists.
+       - Use **Markdown tables** for comparisons or complex data.
+       - **Avoid** long walls of text. Keep paragraphs short (max 3-4 lines).
+       - Use **bold text** for key terms.
+    4. **Synthesis**: Integrate the agent findings smoothly. You can say "Financial analysis shows..." but focus on the facts.
+    5. **Conclusion**: End with a brief concluding summary or recommendation.
+
+    Make the final output look professional, clean, and arranged for quick reading. Output pure Markdown.
     `;
 
     let contents: any = [];
@@ -201,7 +224,7 @@ export const synthesizeReport = async (
     // Add the research context as part of the prompt logic
     contents.push({
       role: 'user',
-      parts: [{ text: `Here are the findings from your agent team:\n\n${researchContext}\n\nPlease provide the final answer to my query: "${query}"` }]
+      parts: [{ text: `Here are the findings from your agent team:\n\n${researchContext}\n\nPlease provide the final arranged answer to my query: "${query}"` }]
     });
 
     const response = await ai.models.generateContent({
