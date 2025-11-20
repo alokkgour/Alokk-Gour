@@ -13,7 +13,8 @@ import {
   Copy,
   Check,
   ChevronDown,
-  BrainCircuit
+  BrainCircuit,
+  Play
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { planResearch, executeResearchTask, synthesizeReport } from './services/geminiService';
@@ -261,13 +262,145 @@ function App() {
     setActiveTasks(prev => update(prev));
   };
 
+  // 2. EXECUTE & SYNTHESIZE
+  const handleStartExecution = async () => {
+    setAgentState(AgentState.SEARCHING);
+
+    const taskResultsMap = new Map<string, SearchResult>();
+    const MAX_CONCURRENCY = 2; 
+
+    const updateStatus = (id: string, status: AgentTask['status']) => {
+      const update = (list: AgentTask[]) => list.map(t => t.id === id ? { ...t, status } : t);
+      tasksRef.current = update(tasksRef.current);
+      setActiveTasks(prev => update(prev));
+    };
+
+    const processQueue = async () => {
+       while (true) {
+          const currentTasks = tasksRef.current;
+          const pending = currentTasks.filter(t => t.status === 'pending');
+          const running = currentTasks.filter(t => t.status === 'running');
+          const completed = currentTasks.filter(t => t.status === 'completed');
+
+          // Exit if everything is done
+          if (pending.length === 0 && running.length === 0) {
+              break;
+          }
+          
+          // Find executable tasks (dependencies met)
+          const executableTasks = pending.filter(t => {
+              if (!t.dependencies || t.dependencies.length === 0) return true;
+              // Check if all dependency IDs exist in completed array
+              return t.dependencies.every(depId => completed.some(c => c.id === depId));
+          });
+
+          if (running.length < MAX_CONCURRENCY && executableTasks.length > 0) {
+              // Pick high priority first, then normal
+              const nextTask = executableTasks.find(t => t.priority === 'high') || executableTasks[0];
+
+              if (nextTask) {
+                  updateStatus(nextTask.id, 'running');
+                  
+                  // BUILD CONTEXT (COLLABORATION)
+                  // Enhance collaboration by including Goal and Title clearly
+                  const contextString = completed.map(t => {
+                      const result = taskResultsMap.get(t.id);
+                      return `[Context from Agent: ${t.agentRole} (Task: ${t.title})]:
+Goal: ${t.goal}
+Findings: ${result?.text || 'No info'}`;
+                  }).join('\n\n---\n\n');
+                  
+                  executeResearchTask(nextTask, contextString).then(result => {
+                      taskResultsMap.set(nextTask.id, result);
+                      updateStatus(nextTask.id, 'completed');
+                      // Recursive call to check for next available tasks immediately
+                      processQueue();
+                  });
+              }
+          } else if (pending.length > 0 && running.length === 0 && executableTasks.length === 0) {
+               // Deadlock detection or waiting? 
+               console.warn("Potential Deadlock: Pending tasks exist but none are executable and nothing is running.");
+               break; 
+          } else if (running.length >= MAX_CONCURRENCY) {
+              // Max concurrency reached, wait for something to finish
+              return;
+          } else {
+             // Nothing executable right now, wait.
+             return;
+          }
+          
+          // Small delay to prevent hot loop if promises resolve instantly
+          await new Promise(r => setTimeout(r, 50));
+       }
+    };
+
+    try {
+        // Start the processor
+        await processQueue();
+
+        // Wait for all to complete
+        while (tasksRef.current.some(t => t.status !== 'completed' && t.status !== 'failed')) {
+            await new Promise(r => setTimeout(r, 200));
+        }
+
+        const finalResults = tasksRef.current.map(task => ({
+            task,
+            result: taskResultsMap.get(task.id) || { text: "Failed", sources: [] }
+        }));
+
+        // 3. SYNTHESIZE
+        setAgentState(AgentState.SYNTHESIZING);
+        
+        // Prepare history for the synthesizer
+        // If called immediately from handleSearch, 'messages' is the history (excludes current query).
+        // If called from a re-render, it might include the query.
+        // We remove the query if it's the last message to avoid duplication in synthesis prompt.
+        let historyForApi = messages.map(m => ({
+            role: m.role,
+            parts: [{ text: m.content }]
+        }));
+
+        if (historyForApi.length > 0 && currentQueryString) {
+             const lastMsg = historyForApi[historyForApi.length - 1];
+             if (lastMsg.parts[0].text === currentQueryString) {
+                 historyForApi = historyForApi.slice(0, -1);
+             }
+        }
+
+        const finalResult = await synthesizeReport(currentQueryString, finalResults, historyForApi);
+        
+        const modelMsg: Message = {
+          id: (Date.now() + 1).toString(),
+          role: 'model',
+          content: finalResult.text,
+          sources: finalResult.sources,
+          agentTasks: tasksRef.current // Save the executed agent state to the message
+        };
+
+        setMessages(prev => [...prev, modelMsg]);
+        setAgentState(AgentState.IDLE);
+        setCurrentQueryString(''); 
+
+    } catch (error) {
+        console.error("Execution Error:", error);
+        const errorMsg: Message = {
+          id: Date.now().toString(),
+          role: 'model',
+          content: "I encountered an error while executing the plan. Please try again.",
+        };
+        setMessages(prev => [...prev, errorMsg]);
+        setAgentState(AgentState.ERROR);
+    }
+  };
+
   // --- Main Orchestration Logic ---
 
   const handleSearch = async (searchQuery: string) => {
     if (!searchQuery.trim()) return;
     
     const initialQuery = searchQuery;
-    // Capture history BEFORE adding the new user message
+    
+    // Capture history BEFORE adding the new user message to state
     // This acts as the "conversation context" for the Planner
     const historyForPlanner = messages; 
 
@@ -275,6 +408,8 @@ function App() {
     setCurrentQueryString(initialQuery);
     setActiveTasks([]);
     tasksRef.current = [];
+    
+    // Trigger Planning UI State
     setAgentState(AgentState.PLANNING);
     
     const userMsg: Message = {
@@ -311,137 +446,13 @@ function App() {
       setActiveTasks(initialTasks);
       tasksRef.current = initialTasks;
       
-      // PAUSE FOR REVIEW
-      setAgentState(AgentState.REVIEWING);
+      // AUTO START: Skip REVIEWING state and go straight to execution
+      handleStartExecution();
 
     } catch (error) {
       console.error(error);
       setAgentState(AgentState.ERROR);
     }
-  };
-
-  // 2. EXECUTE & SYNTHESIZE
-  const handleStartExecution = async () => {
-      setAgentState(AgentState.SEARCHING);
-
-      const taskResultsMap = new Map<string, SearchResult>();
-      const MAX_CONCURRENCY = 2; 
-
-      const updateStatus = (id: string, status: AgentTask['status']) => {
-        const update = (list: AgentTask[]) => list.map(t => t.id === id ? { ...t, status } : t);
-        tasksRef.current = update(tasksRef.current);
-        setActiveTasks(prev => update(prev));
-      };
-
-      const processQueue = async () => {
-         while (true) {
-            const currentTasks = tasksRef.current;
-            const pending = currentTasks.filter(t => t.status === 'pending');
-            const running = currentTasks.filter(t => t.status === 'running');
-            const completed = currentTasks.filter(t => t.status === 'completed');
-
-            // Exit if everything is done
-            if (pending.length === 0 && running.length === 0) {
-                break;
-            }
-            
-            // Find executable tasks (dependencies met)
-            const executableTasks = pending.filter(t => {
-                if (!t.dependencies || t.dependencies.length === 0) return true;
-                // Check if all dependency IDs exist in completed array
-                return t.dependencies.every(depId => completed.some(c => c.id === depId));
-            });
-
-            if (running.length < MAX_CONCURRENCY && executableTasks.length > 0) {
-                // Pick high priority first, then normal
-                const nextTask = executableTasks.find(t => t.priority === 'high') || executableTasks[0];
-
-                if (nextTask) {
-                    updateStatus(nextTask.id, 'running');
-                    
-                    // BUILD CONTEXT (COLLABORATION)
-                    const contextString = completed.map(t => {
-                        const result = taskResultsMap.get(t.id);
-                        return `[Context from Agent: ${t.agentRole} (Task: ${t.title})]:
-Goal: ${t.goal}
-Findings: ${result?.text || 'No info'}`;
-                    }).join('\n\n---\n\n');
-                    
-                    executeResearchTask(nextTask, contextString).then(result => {
-                        taskResultsMap.set(nextTask.id, result);
-                        updateStatus(nextTask.id, 'completed');
-                        // Recursive call to check for next available tasks immediately
-                        processQueue();
-                    });
-                }
-            } else if (pending.length > 0 && running.length === 0 && executableTasks.length === 0) {
-                 // Deadlock detection or waiting? 
-                 console.warn("Potential Deadlock: Pending tasks exist but none are executable and nothing is running.");
-                 break; 
-            } else if (running.length >= MAX_CONCURRENCY) {
-                // Max concurrency reached, wait for something to finish
-                return;
-            } else {
-               // Nothing executable right now, wait.
-               return;
-            }
-            
-            // Small delay to prevent hot loop if promises resolve instantly
-            await new Promise(r => setTimeout(r, 50));
-         }
-      };
-
-      try {
-          // Start the processor
-          await processQueue();
-
-          // Wait for all to complete
-          while (tasksRef.current.some(t => t.status !== 'completed' && t.status !== 'failed')) {
-              await new Promise(r => setTimeout(r, 200));
-          }
-
-          const finalResults = tasksRef.current.map(task => ({
-              task,
-              result: taskResultsMap.get(task.id) || { text: "Failed", sources: [] }
-          }));
-
-          // 3. SYNTHESIZE
-          setAgentState(AgentState.SYNTHESIZING);
-          
-          // We want to pass the history to the synthesizer so it knows what was discussed before.
-          // However, 'messages' currently includes the latest User Query as the last item.
-          // 'synthesizeReport' manually adds the User Query + Findings as the final prompt.
-          // To avoid duplicating the User Query in the prompt (User: Query ... User: Findings for Query), 
-          // we slice off the last message from the history we pass to the API.
-          const historyForApi = messages.slice(0, -1).map(m => ({
-            role: m.role,
-            parts: [{ text: m.content }]
-          }));
-
-          const finalResult = await synthesizeReport(currentQueryString, finalResults, historyForApi);
-          
-          const modelMsg: Message = {
-            id: (Date.now() + 1).toString(),
-            role: 'model',
-            content: finalResult.text,
-            sources: finalResult.sources,
-            agentTasks: tasksRef.current // Save the executed agent state to the message
-          };
-
-          setMessages(prev => [...prev, modelMsg]);
-          setAgentState(AgentState.IDLE);
-          setCurrentQueryString(''); 
-
-      } catch (error) {
-          console.error("Execution Error:", error);
-          const errorMsg: Message = {
-            id: Date.now().toString(),
-            role: 'model',
-            content: "I encountered an error while executing the plan. Please try again.",
-          };
-          setMessages(prev => [...prev, errorMsg]);
-          setAgentState(AgentState.ERROR);
-      }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
